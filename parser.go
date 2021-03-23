@@ -35,6 +35,15 @@ var places = []ParseOption{
 	Dow,
 }
 
+var fieldNames = []string {
+	"Second",
+	"Minute",
+	"Hour",
+	"Day of month",
+	"Month",
+	"Day of week",
+}
+
 var defaults = []string{
 	"0",
 	"0",
@@ -49,6 +58,22 @@ type Parser struct {
 	options ParseOption
 }
 
+type ParseErrorInvalidField struct {
+	Err   error
+	field string // better type?
+
+}
+func (e *ParseErrorInvalidField) Error() string {
+	return fmt.Sprintf("%s field could not be parsed.", e.field)
+}
+
+type ParseErrorInvalidValue struct {
+	expression string
+	reason     string
+}
+func (e *ParseErrorInvalidValue) Error() string {
+	return fmt.Sprintf("Error parsing expression `%s`: %s", e.expression, e.reason)
+}
 // NewParser creates a Parser with custom options.
 //
 // It panics if more than one Optional is given, since it would be impossible to
@@ -120,22 +145,28 @@ func (p Parser) Parse(spec string) (Schedule, error) {
 		return nil, err
 	}
 
-	field := func(field string, r bounds) uint64 {
+	field := func(field string, fieldName string, r bounds) uint64 {
 		if err != nil {
 			return 0
 		}
-		var bits uint64
-		bits, err = getField(field, r)
+		bits, validateErr := getField(field, r)
+		if validateErr != nil {
+			err = &ParseErrorInvalidField{
+				Err:   validateErr,
+				field: fieldName,
+			}
+		}
+
 		return bits
 	}
 
 	var (
-		second     = field(fields[0], seconds)
-		minute     = field(fields[1], minutes)
-		hour       = field(fields[2], hours)
-		dayofmonth = field(fields[3], dom)
-		month      = field(fields[4], months)
-		dayofweek  = field(fields[5], dow)
+		second     = field(fields[0], fieldNames[0], seconds)
+		minute     = field(fields[1], fieldNames[1], minutes)
+		hour       = field(fields[2], fieldNames[2], hours)
+		dayofmonth = field(fields[3], fieldNames[3], dom)
+		month      = field(fields[4], fieldNames[4], months)
+		dayofweek  = field(fields[5], fieldNames[5], dow)
 	)
 	if err != nil {
 		return nil, err
@@ -277,7 +308,10 @@ func getRange(expr string, r bounds) (uint64, error) {
 				return 0, err
 			}
 		default:
-			return 0, fmt.Errorf("too many hyphens: %s", expr)
+			return 0, &ParseErrorInvalidValue{
+				reason:     "too many hyphens",
+				expression: expr,
+			}
 		}
 	}
 
@@ -298,20 +332,32 @@ func getRange(expr string, r bounds) (uint64, error) {
 			extra = 0
 		}
 	default:
-		return 0, fmt.Errorf("too many slashes: %s", expr)
+		return 0, &ParseErrorInvalidValue{reason: "too many slashes", expression: expr}
 	}
 
 	if start < r.min {
-		return 0, fmt.Errorf("beginning of range (%d) below minimum (%d): %s", start, r.min, expr)
+		return 0, &ParseErrorInvalidValue{
+			reason:     fmt.Sprintf("beginning of range (%d) below minimum (%d)", start, r.min),
+			expression: expr,
+		}
 	}
 	if end > r.max {
-		return 0, fmt.Errorf("end of range (%d) above maximum (%d): %s", end, r.max, expr)
+		return 0, &ParseErrorInvalidValue{
+			reason:     fmt.Sprintf("end of range (%d) above maximum (%d)", end, r.max),
+			expression: expr,
+		}
 	}
 	if start > end {
-		return 0, fmt.Errorf("beginning of range (%d) beyond end of range (%d): %s", start, end, expr)
+		return 0, &ParseErrorInvalidValue{
+			reason:     fmt.Sprintf("beginning of range (%d) beyond end of range (%d)", start, end),
+			expression: expr,
+		}
 	}
 	if step == 0 {
-		return 0, fmt.Errorf("step of range should be a positive number: %s", expr)
+		return 0, &ParseErrorInvalidValue{
+			reason:     "step of range should be a positive number",
+			expression: expr,
+		}
 	}
 
 	return getBits(start, end, step) | extra, nil
@@ -331,10 +377,16 @@ func parseIntOrName(expr string, names map[string]uint) (uint, error) {
 func mustParseInt(expr string) (uint, error) {
 	num, err := strconv.Atoi(expr)
 	if err != nil {
-		return 0, fmt.Errorf("failed to parse int from %s: %s", expr, err)
+		return 0, &ParseErrorInvalidValue{
+			reason:     "failed to parse int",
+			expression: expr,
+		}
 	}
 	if num < 0 {
-		return 0, fmt.Errorf("negative number (%d) not allowed: %s", num, expr)
+		return 0, &ParseErrorInvalidValue{
+			reason:     "negative number found, but not allowed",
+			expression: expr,
+		}
 	}
 
 	return uint(num), nil
