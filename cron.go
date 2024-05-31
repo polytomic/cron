@@ -242,12 +242,13 @@ func (c *Cron) run() {
 
 	// Figure out the next activation times for each entry.
 	now := c.now()
+	epoch := c.now()
 	if c.epochProvider != nil {
-		now = c.epochProvider()
+		epoch = c.epochProvider()
 	}
 	for _, entry := range c.entries {
-		entry.Next = entry.Schedule.Next(now)
-		c.logger.Info("schedule", "now", now, "entry", entry.ID, "next", entry.Next)
+		entry.Next = entry.Schedule.Next(epoch)
+		c.logger.Info("schedule", "now", now, "epoch", epoch, "entry", entry.ID, "next", entry.Next)
 	}
 
 	for {

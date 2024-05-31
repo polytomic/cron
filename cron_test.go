@@ -360,12 +360,16 @@ func TestStartTime(t *testing.T) {
 	wg := &sync.WaitGroup{}
 	wg.Add(1)
 	now := time.Now()
+	// set the schedule to have fired 1 second in the past
 	spec := fmt.Sprintf("%d * * * * ?", now.Add(OneSecond*-1).Second())
 	fmt.Println(spec)
 
 	cron := New(
 		WithEpochProvider(func() time.Time {
-			return now.Add(OneSecond * -2)
+			// set the epoch time to 30 seconds ago; if we inadvertently use the
+			// epoch as "now", we will get a job firing ~29 seconds in the future
+			// and the test will fail
+			return now.Add(OneSecond * -30)
 		}),
 		WithParser(secondParser),
 	)
