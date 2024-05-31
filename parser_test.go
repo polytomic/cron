@@ -33,8 +33,8 @@ func TestRange(t *testing.T) {
 		{"*/2", 1, 3, 1<<1 | 1<<3, ""},
 
 		{"5--5", 0, 0, zero, "too many hyphens"},
-		{"jan-x", 0, 0, zero, "failed to parse int"},
-		{"2-x", 1, 5, zero, "failed to parse int"},
+		{"jan-x", 0, 0, zero, "is not a valid integer"},
+		{"2-x", 1, 5, zero, "is not a valid integer"},
 		{"*/-12", 0, 0, zero, "negative number"},
 		{"*//2", 0, 0, zero, "too many slashes"},
 		{"1", 3, 5, zero, "below minimum"},

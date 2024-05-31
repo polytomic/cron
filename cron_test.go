@@ -364,7 +364,9 @@ func TestStartTime(t *testing.T) {
 	fmt.Println(spec)
 
 	cron := New(
-		WithInitialTime(now.Add(OneSecond*-2)),
+		WithEpochProvider(func() time.Time {
+			return now.Add(OneSecond * -2)
+		}),
 		WithParser(secondParser),
 	)
 	_, err := cron.AddFunc(spec, func() { wg.Done() })
