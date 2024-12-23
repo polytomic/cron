@@ -21,7 +21,7 @@ type Cron struct {
 	logger        Logger
 	runningMu     sync.Mutex
 	location      *time.Location
-	epochProvider func() time.Time
+	epochProvider func(tag string) time.Time
 	parser        ScheduleParser
 	nextID        EntryID
 	jobWaiter     sync.WaitGroup
@@ -35,6 +35,12 @@ type ScheduleParser interface {
 // Job is an interface for submitted cron jobs.
 type Job interface {
 	Run()
+}
+
+// Tagged extends a Job with a Tag that uniquely identifies the job.
+type Tagged struct {
+	Job
+	Tag string
 }
 
 // Schedule describes a job's duty cycle.
@@ -52,6 +58,8 @@ type Entry struct {
 	// ID is the cron-assigned ID of this entry, which may be used to look up a
 	// snapshot or remove it.
 	ID EntryID
+
+	Tag string
 
 	// Schedule on which this job should be run.
 	Schedule Schedule
@@ -166,6 +174,9 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
 		WrappedJob: c.chain.Then(cmd),
 		Job:        cmd,
 	}
+	if tj, ok := cmd.(Tagged); ok {
+		entry.Tag = tj.Tag
+	}
 	if !c.running {
 		c.entries = append(c.entries, entry)
 	} else {
@@ -242,13 +253,17 @@ func (c *Cron) run() {
 
 	// Figure out the next activation times for each entry.
 	now := c.now()
-	epoch := c.now()
+	baseEpoch := c.now()
 	if c.epochProvider != nil {
-		epoch = c.epochProvider()
+		baseEpoch = c.epochProvider("")
 	}
 	for _, entry := range c.entries {
+		epoch := baseEpoch
+		if entry.Tag != "" && c.epochProvider != nil {
+			epoch = c.epochProvider(entry.Tag)
+		}
 		entry.Next = entry.Schedule.Next(epoch)
-		c.logger.Info("schedule", "now", now, "epoch", epoch, "entry", entry.ID, "next", entry.Next)
+		c.logger.Info("schedule", "now", now, "epoch", epoch, "entry", entry.ID, "entry_tag", entry.Tag, "next", entry.Next)
 	}
 
 	for {
@@ -286,7 +301,7 @@ func (c *Cron) run() {
 				now = c.now()
 				newEntry.Next = newEntry.Schedule.Next(now)
 				c.entries = append(c.entries, newEntry)
-				c.logger.Info("added", "now", now, "entry", newEntry.ID, "next", newEntry.Next)
+				c.logger.Info("added", "now", now, "entry", newEntry.ID, "entry_tag", newEntry.Tag, "next", newEntry.Next)
 
 			case replyChan := <-c.snapshot:
 				replyChan <- c.entrySnapshot()

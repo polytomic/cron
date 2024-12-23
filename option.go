@@ -45,7 +45,7 @@ func WithLogger(logger Logger) Option {
 }
 
 // WithEpochProvider sets a provider to get the epoch time
-func WithEpochProvider(ep func() time.Time) Option {
+func WithEpochProvider(ep func(tag string) time.Time) Option {
 	return func(c *Cron) {
 		c.epochProvider = ep
 	}

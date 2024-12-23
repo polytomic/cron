@@ -365,7 +365,7 @@ func TestStartTime(t *testing.T) {
 	fmt.Println(spec)
 
 	cron := New(
-		WithEpochProvider(func() time.Time {
+		WithEpochProvider(func(string) time.Time {
 			// set the epoch time to 30 seconds ago; if we inadvertently use the
 			// epoch as "now", we will get a job firing ~29 seconds in the future
 			// and the test will fail
