@@ -59,8 +59,6 @@ type Entry struct {
 	// snapshot or remove it.
 	ID EntryID
 
-	Tag string
-
 	// Schedule on which this job should be run.
 	Schedule Schedule
 
@@ -174,9 +172,6 @@ func (c *Cron) Schedule(schedule Schedule, cmd Job) EntryID {
 		WrappedJob: c.chain.Then(cmd),
 		Job:        cmd,
 	}
-	if tj, ok := cmd.(Tagged); ok {
-		entry.Tag = tj.Tag
-	}
 	if !c.running {
 		c.entries = append(c.entries, entry)
 	} else {
@@ -246,6 +241,15 @@ func (c *Cron) Run() {
 	c.run()
 }
 
+// getJobTag returns the tag for a Job. If the Job is not a Tagged, it returns
+// an empty string.
+func getJobTag(cmd Job) string {
+	if tj, ok := cmd.(Tagged); ok {
+		return tj.Tag
+	}
+	return ""
+}
+
 // run the scheduler.. this is private just due to the need to synchronize
 // access to the 'running' state variable.
 func (c *Cron) run() {
@@ -254,16 +258,14 @@ func (c *Cron) run() {
 	// Figure out the next activation times for each entry.
 	now := c.now()
 	baseEpoch := c.now()
-	if c.epochProvider != nil {
-		baseEpoch = c.epochProvider("")
-	}
 	for _, entry := range c.entries {
 		epoch := baseEpoch
-		if entry.Tag != "" && c.epochProvider != nil {
-			epoch = c.epochProvider(entry.Tag)
+		tag := getJobTag(entry.Job)
+		if c.epochProvider != nil {
+			epoch = c.epochProvider(tag)
 		}
 		entry.Next = entry.Schedule.Next(epoch)
-		c.logger.Info("schedule", "now", now, "epoch", epoch, "entry", entry.ID, "entry_tag", entry.Tag, "next", entry.Next)
+		c.logger.Info("schedule", "now", now, "epoch", epoch, "entry", entry.ID, "entry_tag", tag, "next", entry.Next)
 	}
 
 	for {
@@ -301,7 +303,7 @@ func (c *Cron) run() {
 				now = c.now()
 				newEntry.Next = newEntry.Schedule.Next(now)
 				c.entries = append(c.entries, newEntry)
-				c.logger.Info("added", "now", now, "entry", newEntry.ID, "entry_tag", newEntry.Tag, "next", newEntry.Next)
+				c.logger.Info("added", "now", now, "entry", newEntry.ID, "entry_tag", getJobTag(newEntry.Job), "next", newEntry.Next)
 
 			case replyChan := <-c.snapshot:
 				replyChan <- c.entrySnapshot()
