@@ -16,6 +16,7 @@ type Cron struct {
 	stop          chan struct{}
 	add           chan *Entry
 	remove        chan EntryID
+	replaceByTag  chan tagOp
 	snapshot      chan chan []Entry
 	running       bool
 	logger        Logger
@@ -41,6 +42,17 @@ type Job interface {
 type Tagged struct {
 	Job
 	Tag string
+}
+
+// tagOp is an internal command, processed by the scheduler goroutine, that
+// atomically removes every entry carrying tag and (when entry is non-nil)
+// appends entry in its place. reply receives the new entry's ID (or 0 for a
+// pure removal). Routing this through the run loop preserves the invariant
+// that c.entries is only mutated by a single owner.
+type tagOp struct {
+	tag   string
+	entry *Entry
+	reply chan EntryID
 }
 
 // Schedule describes a job's duty cycle.
@@ -119,17 +131,18 @@ func (s byTime) Less(i, j int) bool {
 // See "cron.With*" to modify the default behavior.
 func New(opts ...Option) *Cron {
 	c := &Cron{
-		entries:   nil,
-		chain:     NewChain(),
-		add:       make(chan *Entry),
-		stop:      make(chan struct{}),
-		snapshot:  make(chan chan []Entry),
-		remove:    make(chan EntryID),
-		running:   false,
-		runningMu: sync.Mutex{},
-		logger:    DefaultLogger,
-		location:  time.Local,
-		parser:    standardParser,
+		entries:      nil,
+		chain:        NewChain(),
+		add:          make(chan *Entry),
+		stop:         make(chan struct{}),
+		snapshot:     make(chan chan []Entry),
+		remove:       make(chan EntryID),
+		replaceByTag: make(chan tagOp),
+		running:      false,
+		runningMu:    sync.Mutex{},
+		logger:       DefaultLogger,
+		location:     time.Local,
+		parser:       standardParser,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -218,6 +231,58 @@ func (c *Cron) Remove(id EntryID) {
 	}
 }
 
+// ReplaceByTag atomically removes every entry whose job carries tag and adds
+// cmd on the given schedule in their place, returning the new entry's ID. cmd
+// is tagged with tag (wrapped if it is not already a Tagged carrying tag) so
+// the new entry remains addressable by ReplaceByTag/RemoveByTag/Entries.
+//
+// The remove-and-add is performed as one step under the same ownership of the
+// entry list as Schedule/Remove, so concurrent ReplaceByTag calls for the same
+// tag cannot leave behind duplicate entries. An empty tag is rejected (returns
+// 0 without modifying the schedule) so untagged jobs are never matched.
+func (c *Cron) ReplaceByTag(tag string, schedule Schedule, cmd Job) EntryID {
+	c.runningMu.Lock()
+	defer c.runningMu.Unlock()
+	if tag == "" {
+		return 0
+	}
+	if getJobTag(cmd) != tag {
+		cmd = Tagged{Job: cmd, Tag: tag}
+	}
+	c.nextID++
+	entry := &Entry{
+		ID:         c.nextID,
+		Schedule:   schedule,
+		WrappedJob: c.chain.Then(cmd),
+		Job:        cmd,
+	}
+	if !c.running {
+		c.removeEntriesByTag(tag)
+		c.entries = append(c.entries, entry)
+		return entry.ID
+	}
+	reply := make(chan EntryID, 1)
+	c.replaceByTag <- tagOp{tag: tag, entry: entry, reply: reply}
+	return <-reply
+}
+
+// RemoveByTag atomically removes every entry whose job carries tag. An empty
+// tag is a no-op so untagged jobs are never matched.
+func (c *Cron) RemoveByTag(tag string) {
+	c.runningMu.Lock()
+	defer c.runningMu.Unlock()
+	if tag == "" {
+		return
+	}
+	if !c.running {
+		c.removeEntriesByTag(tag)
+		return
+	}
+	reply := make(chan EntryID, 1)
+	c.replaceByTag <- tagOp{tag: tag, entry: nil, reply: reply}
+	<-reply
+}
+
 // Start the cron scheduler in its own goroutine, or no-op if already started.
 func (c *Cron) Start() {
 	c.runningMu.Lock()
@@ -244,8 +309,13 @@ func (c *Cron) Run() {
 // getJobTag returns the tag for a Job. If the Job is not a Tagged, it returns
 // an empty string.
 func getJobTag(cmd Job) string {
-	if tj, ok := cmd.(Tagged); ok {
+	switch tj := cmd.(type) {
+	case Tagged:
 		return tj.Tag
+	case *Tagged:
+		if tj != nil {
+			return tj.Tag
+		}
 	}
 	return ""
 }
@@ -319,6 +389,19 @@ func (c *Cron) run() {
 				now = c.now()
 				c.removeEntry(id)
 				c.logger.Info("removed", "entry", id)
+
+			case op := <-c.replaceByTag:
+				timer.Stop()
+				now = c.now()
+				removed := c.removeEntriesByTag(op.tag)
+				var id EntryID
+				if op.entry != nil {
+					op.entry.Next = op.entry.Schedule.Next(now)
+					c.entries = append(c.entries, op.entry)
+					id = op.entry.ID
+				}
+				op.reply <- id
+				c.logger.Info("replaced by tag", "tag", op.tag, "removed", removed, "entry", id)
 			}
 
 			break
@@ -374,4 +457,25 @@ func (c *Cron) removeEntry(id EntryID) {
 		}
 	}
 	c.entries = entries
+}
+
+// removeEntriesByTag drops every entry whose job carries the given tag and
+// returns how many were removed. The caller must have exclusive access to
+// c.entries (either the scheduler goroutine, or runningMu held while stopped).
+// An empty tag never matches, so untagged jobs are never affected.
+func (c *Cron) removeEntriesByTag(tag string) int {
+	if tag == "" {
+		return 0
+	}
+	var kept []*Entry
+	removed := 0
+	for _, e := range c.entries {
+		if getJobTag(e.Job) == tag {
+			removed++
+			continue
+		}
+		kept = append(kept, e)
+	}
+	c.entries = kept
+	return removed
 }
