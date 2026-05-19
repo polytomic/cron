@@ -309,8 +309,13 @@ func (c *Cron) Run() {
 // getJobTag returns the tag for a Job. If the Job is not a Tagged, it returns
 // an empty string.
 func getJobTag(cmd Job) string {
-	if tj, ok := cmd.(Tagged); ok {
+	switch tj := cmd.(type) {
+	case Tagged:
 		return tj.Tag
+	case *Tagged:
+		if tj != nil {
+			return tj.Tag
+		}
 	}
 	return ""
 }

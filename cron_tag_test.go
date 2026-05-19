@@ -103,6 +103,21 @@ func TestRemoveByTagLeavesUntagged(t *testing.T) {
 	}
 }
 
+// Pointer-tagged jobs also satisfy Job and should be addressable by tag.
+func TestRemoveByTagRemovesPointerTaggedJob(t *testing.T) {
+	cron := newWithSeconds()
+	cron.Schedule(everySecond(t, cron), &Tagged{
+		Job: FuncJob(func() {}),
+		Tag: "sync",
+	})
+
+	cron.RemoveByTag("sync")
+
+	if got := countByTag(cron, "sync"); got != 0 {
+		t.Fatalf("want 0 entries for tag, got %d", got)
+	}
+}
+
 // An empty tag must never match: ReplaceByTag returns 0 and adds nothing;
 // RemoveByTag is a no-op and does not sweep untagged entries.
 func TestEmptyTagIsNoop(t *testing.T) {
