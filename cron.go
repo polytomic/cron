@@ -550,23 +550,23 @@ func (c *Cron) removeEntriesByTag(tag string) int {
 // replaceEntriesByPrefix performs the actual mutation for ReplaceByPrefix.
 // The caller must have exclusive access to c.entries (either the scheduler
 // goroutine, or runningMu held while stopped). Every entry whose tag begins
-// with prefix is dropped unless its tag also appears in entries; then each
-// tag in entries is installed (replacing any same-tag entry that survived).
-// Returns the new EntryID for each installed tag.
+// with prefix is dropped (including the ones whose tag is in entries: they
+// will be reinstalled below with fresh IDs); then each tag in entries is
+// installed. Returns the new EntryID for each installed tag.
+//
+// The public ReplaceByPrefix guarantees that every key in entries shares
+// prefix, so dropping all prefix-matching entries here is safe: nothing we
+// would want to keep also matches the prefix.
 //
 // A zero now is the sentinel for "scheduler is not running yet" and matches
 // the convention used by Schedule and the not-running branch of
 // ReplaceByTag: newly-installed entries are left with a zero Next so the
 // run() startup loop computes it from the epoch like everything else.
 func (c *Cron) replaceEntriesByPrefix(prefix string, entries map[string]PrefixEntry, now time.Time) map[string]EntryID {
-	// Drop prefix-matching entries that are not in the desired set.
 	var kept []*Entry
 	for _, e := range c.entries {
-		tag := getJobTag(e.Job)
-		if strings.HasPrefix(tag, prefix) {
-			if _, retain := entries[tag]; !retain {
-				continue
-			}
+		if strings.HasPrefix(getJobTag(e.Job), prefix) {
+			continue
 		}
 		kept = append(kept, e)
 	}
@@ -574,17 +574,6 @@ func (c *Cron) replaceEntriesByPrefix(prefix string, entries map[string]PrefixEn
 
 	result := make(map[string]EntryID, len(entries))
 	for tag, ent := range entries {
-		// Drop any prior same-tag entries that survived the prefix sweep
-		// (e.g. when we are replacing a tag that already exists).
-		var withoutTag []*Entry
-		for _, e := range c.entries {
-			if getJobTag(e.Job) == tag {
-				continue
-			}
-			withoutTag = append(withoutTag, e)
-		}
-		c.entries = withoutTag
-
 		cmd := ent.Job
 		if getJobTag(cmd) != tag {
 			cmd = Tagged{Job: cmd, Tag: tag}
