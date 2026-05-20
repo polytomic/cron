@@ -316,7 +316,10 @@ func (c *Cron) ReplaceByPrefix(prefix string, entries map[string]PrefixEntry) ma
 		}
 	}
 	if !c.running {
-		return c.replaceEntriesByPrefix(prefix, entries, c.now())
+		// Match Schedule / ReplaceByTag semantics before the scheduler is
+		// running: leave Next zero so the run() startup loop computes it
+		// from the epoch like every other entry.
+		return c.replaceEntriesByPrefix(prefix, entries, time.Time{})
 	}
 	reply := make(chan map[string]EntryID, 1)
 	c.replaceByPrefix <- prefixOp{prefix: prefix, entries: entries, reply: reply}
@@ -550,6 +553,11 @@ func (c *Cron) removeEntriesByTag(tag string) int {
 // with prefix is dropped unless its tag also appears in entries; then each
 // tag in entries is installed (replacing any same-tag entry that survived).
 // Returns the new EntryID for each installed tag.
+//
+// A zero now is the sentinel for "scheduler is not running yet" and matches
+// the convention used by Schedule and the not-running branch of
+// ReplaceByTag: newly-installed entries are left with a zero Next so the
+// run() startup loop computes it from the epoch like everything else.
 func (c *Cron) replaceEntriesByPrefix(prefix string, entries map[string]PrefixEntry, now time.Time) map[string]EntryID {
 	// Drop prefix-matching entries that are not in the desired set.
 	var kept []*Entry
@@ -588,7 +596,9 @@ func (c *Cron) replaceEntriesByPrefix(prefix string, entries map[string]PrefixEn
 			WrappedJob: c.chain.Then(cmd),
 			Job:        cmd,
 		}
-		newEntry.Next = newEntry.Schedule.Next(now)
+		if !now.IsZero() {
+			newEntry.Next = newEntry.Schedule.Next(now)
+		}
 		c.entries = append(c.entries, newEntry)
 		result[tag] = newEntry.ID
 	}

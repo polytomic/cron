@@ -17,6 +17,26 @@ func tagsByPrefix(c *Cron, prefix string) []string {
 	return tags
 }
 
+// Before the scheduler is running, Entries() must show zero Next for
+// entries installed via ReplaceByPrefix - matching the Entry contract and
+// the behaviour of Schedule and the not-running branch of ReplaceByTag.
+// The run() startup loop computes Next from the configured epoch for
+// every entry; pre-computing it would skip the epoch-aware initialisation.
+func TestReplaceByPrefixBeforeRunningLeavesNextZero(t *testing.T) {
+	cron := newWithSeconds()
+	sched := everySecond(t, cron)
+
+	cron.ReplaceByPrefix("sync:s1:", map[string]PrefixEntry{
+		"sync:s1:a": {Schedule: sched, Job: FuncJob(func() {})},
+	})
+
+	for _, e := range cron.Entries() {
+		if !e.Next.IsZero() {
+			t.Fatalf("entry %q Next should be zero before Start, got %v", getJobTag(e.Job), e.Next)
+		}
+	}
+}
+
 // ReplaceByPrefix must drop every prefix-matching entry that is not in the
 // desired set and install (or replace) every entry that is.
 func TestReplaceByPrefixReconcilesSet(t *testing.T) {
@@ -99,7 +119,7 @@ func TestReplaceByPrefixConcurrentNoStaleTags(t *testing.T) {
 	for _, t := range tags {
 		set[t] = true
 	}
-	if !((len(set) == 2 && set["sync:s1:a"] && (set["sync:s1:b"] || set["sync:s1:c"]))) {
+	if !(len(set) == 2 && set["sync:s1:a"] && (set["sync:s1:b"] || set["sync:s1:c"])) {
 		t.Fatalf("converged to a non-desired set: %v", tags)
 	}
 	if set["sync:s1:b"] && set["sync:s1:c"] {
