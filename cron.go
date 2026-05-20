@@ -3,6 +3,7 @@ package cron
 import (
 	"context"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -11,21 +12,22 @@ import (
 // specified by the schedule. It may be started, stopped, and the entries may
 // be inspected while running.
 type Cron struct {
-	entries       []*Entry
-	chain         Chain
-	stop          chan struct{}
-	add           chan *Entry
-	remove        chan EntryID
-	replaceByTag  chan tagOp
-	snapshot      chan chan []Entry
-	running       bool
-	logger        Logger
-	runningMu     sync.Mutex
-	location      *time.Location
-	epochProvider func(tag string) time.Time
-	parser        ScheduleParser
-	nextID        EntryID
-	jobWaiter     sync.WaitGroup
+	entries         []*Entry
+	chain           Chain
+	stop            chan struct{}
+	add             chan *Entry
+	remove          chan EntryID
+	replaceByTag    chan tagOp
+	replaceByPrefix chan prefixOp
+	snapshot        chan chan []Entry
+	running         bool
+	logger          Logger
+	runningMu       sync.Mutex
+	location        *time.Location
+	epochProvider   func(tag string) time.Time
+	parser          ScheduleParser
+	nextID          EntryID
+	jobWaiter       sync.WaitGroup
 }
 
 // ScheduleParser is an interface for schedule spec parsers that return a Schedule
@@ -53,6 +55,22 @@ type tagOp struct {
 	tag   string
 	entry *Entry
 	reply chan EntryID
+}
+
+// PrefixEntry pairs a schedule with the job to run on it, for the desired-set
+// argument to ReplaceByPrefix.
+type PrefixEntry struct {
+	Schedule Schedule
+	Job      Job
+}
+
+// prefixOp is an internal command, processed by the scheduler goroutine, that
+// atomically replaces every entry whose tag has prefix with the supplied
+// desired set. The desired set's keys are the tags to install.
+type prefixOp struct {
+	prefix  string
+	entries map[string]PrefixEntry
+	reply   chan map[string]EntryID
 }
 
 // Schedule describes a job's duty cycle.
@@ -131,18 +149,19 @@ func (s byTime) Less(i, j int) bool {
 // See "cron.With*" to modify the default behavior.
 func New(opts ...Option) *Cron {
 	c := &Cron{
-		entries:      nil,
-		chain:        NewChain(),
-		add:          make(chan *Entry),
-		stop:         make(chan struct{}),
-		snapshot:     make(chan chan []Entry),
-		remove:       make(chan EntryID),
-		replaceByTag: make(chan tagOp),
-		running:      false,
-		runningMu:    sync.Mutex{},
-		logger:       DefaultLogger,
-		location:     time.Local,
-		parser:       standardParser,
+		entries:         nil,
+		chain:           NewChain(),
+		add:             make(chan *Entry),
+		stop:            make(chan struct{}),
+		snapshot:        make(chan chan []Entry),
+		remove:          make(chan EntryID),
+		replaceByTag:    make(chan tagOp),
+		replaceByPrefix: make(chan prefixOp),
+		running:         false,
+		runningMu:       sync.Mutex{},
+		logger:          DefaultLogger,
+		location:        time.Local,
+		parser:          standardParser,
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -263,6 +282,44 @@ func (c *Cron) ReplaceByTag(tag string, schedule Schedule, cmd Job) EntryID {
 	}
 	reply := make(chan EntryID, 1)
 	c.replaceByTag <- tagOp{tag: tag, entry: entry, reply: reply}
+	return <-reply
+}
+
+// ReplaceByPrefix atomically reconciles every entry whose tag begins with
+// prefix against the supplied desired set: any entry currently scheduled with
+// a tag matching prefix that is not a key of entries is removed, and each tag
+// in entries is installed (or replaced if it already exists). Jobs are tagged
+// with their key (wrapped if not already a Tagged carrying that tag) so the
+// new entries stay addressable.
+//
+// The remove-and-install is performed as one step under the same ownership of
+// the entry list as Schedule/Remove, so concurrent ReplaceByPrefix calls for
+// the same prefix - or an interleave with ReplaceByTag/Schedule/Remove -
+// cannot leave stale prefix-matching entries behind. This is the primitive
+// for 1:N reconciliation (e.g. multiple cron entries per sync), where
+// per-tag atomicity alone is insufficient because the set diff has to be
+// atomic as a whole.
+//
+// An empty prefix is rejected (returns nil and modifies nothing) so untagged
+// jobs and entries belonging to other namespaces are never matched. Every
+// key in entries must have prefix as a string prefix; if any key does not,
+// the call is rejected as a misuse and the schedule is left unchanged.
+func (c *Cron) ReplaceByPrefix(prefix string, entries map[string]PrefixEntry) map[string]EntryID {
+	c.runningMu.Lock()
+	defer c.runningMu.Unlock()
+	if prefix == "" {
+		return nil
+	}
+	for tag := range entries {
+		if !strings.HasPrefix(tag, prefix) {
+			return nil
+		}
+	}
+	if !c.running {
+		return c.replaceEntriesByPrefix(prefix, entries, c.now())
+	}
+	reply := make(chan map[string]EntryID, 1)
+	c.replaceByPrefix <- prefixOp{prefix: prefix, entries: entries, reply: reply}
 	return <-reply
 }
 
@@ -402,6 +459,13 @@ func (c *Cron) run() {
 				}
 				op.reply <- id
 				c.logger.Info("replaced by tag", "tag", op.tag, "removed", removed, "entry", id)
+
+			case op := <-c.replaceByPrefix:
+				timer.Stop()
+				now = c.now()
+				result := c.replaceEntriesByPrefix(op.prefix, op.entries, now)
+				op.reply <- result
+				c.logger.Info("replaced by prefix", "prefix", op.prefix, "installed", len(result))
 			}
 
 			break
@@ -478,4 +542,55 @@ func (c *Cron) removeEntriesByTag(tag string) int {
 	}
 	c.entries = kept
 	return removed
+}
+
+// replaceEntriesByPrefix performs the actual mutation for ReplaceByPrefix.
+// The caller must have exclusive access to c.entries (either the scheduler
+// goroutine, or runningMu held while stopped). Every entry whose tag begins
+// with prefix is dropped unless its tag also appears in entries; then each
+// tag in entries is installed (replacing any same-tag entry that survived).
+// Returns the new EntryID for each installed tag.
+func (c *Cron) replaceEntriesByPrefix(prefix string, entries map[string]PrefixEntry, now time.Time) map[string]EntryID {
+	// Drop prefix-matching entries that are not in the desired set.
+	var kept []*Entry
+	for _, e := range c.entries {
+		tag := getJobTag(e.Job)
+		if strings.HasPrefix(tag, prefix) {
+			if _, retain := entries[tag]; !retain {
+				continue
+			}
+		}
+		kept = append(kept, e)
+	}
+	c.entries = kept
+
+	result := make(map[string]EntryID, len(entries))
+	for tag, ent := range entries {
+		// Drop any prior same-tag entries that survived the prefix sweep
+		// (e.g. when we are replacing a tag that already exists).
+		var withoutTag []*Entry
+		for _, e := range c.entries {
+			if getJobTag(e.Job) == tag {
+				continue
+			}
+			withoutTag = append(withoutTag, e)
+		}
+		c.entries = withoutTag
+
+		cmd := ent.Job
+		if getJobTag(cmd) != tag {
+			cmd = Tagged{Job: cmd, Tag: tag}
+		}
+		c.nextID++
+		newEntry := &Entry{
+			ID:         c.nextID,
+			Schedule:   ent.Schedule,
+			WrappedJob: c.chain.Then(cmd),
+			Job:        cmd,
+		}
+		newEntry.Next = newEntry.Schedule.Next(now)
+		c.entries = append(c.entries, newEntry)
+		result[tag] = newEntry.ID
+	}
+	return result
 }
